@@ -381,7 +381,12 @@ const KEY = {
   preReq:'Pre transfer requirements', postReq:'Post transfer requirements',
   stage:'Move Status', movedAt:'Moved At', movedBy:'Moved By', issue:'Issue'
 };
-const STAGES = ['Not started','Prepped','In transit','Delivered','Installed','Verified'];
+const STAGES = ['Not started','In transit','Installed'];
+/* Values written by the earlier six-stage version, or typed by hand into the sheet. */
+const LEGACY_STAGE = {
+  'prepped':'Not started', 'delivered':'In transit', 'verified':'Installed',
+  'complete':'Installed', 'completed':'Installed', 'done':'Installed'
+};
 
 /* Fields an unlocked editor may change. Must match EDITABLE in Code.gs — the server
    rejects anything else, this list only decides what the form offers. */
@@ -503,9 +508,14 @@ function conflictOf(r){
   if(v==='unknown') return 'Transfer decision missing';
   return '';
 }
-const stageOf   = r => t(r[KEY.stage]) || STAGES[0];
+function stageOf(r){
+  const s = t(r[KEY.stage]);
+  if(!s) return STAGES[0];
+  if(STAGES.includes(s)) return s;
+  return LEGACY_STAGE[s.toLowerCase()] || STAGES[0];
+}
 const stageIdx  = r => Math.max(0, STAGES.indexOf(stageOf(r)));
-const isDone    = r => stageOf(r) === 'Verified';
+const isDone    = r => stageOf(r) === 'Installed';
 const inScope   = r => verdictOf(r) === 'move';
 const issueOf   = r => t(r[KEY.issue]);
 
@@ -1102,8 +1112,8 @@ function renderAsset(id){
 
   ${v === 'move' ? `<div class="card">
     <p class="eyebrow">Move status</p>
-    <div class="pipe">${STAGES.map((s,i) =>
-      `<i class="${issue ? 'blocked' : (i <= idx && idx > 0 ? 'done' : '')}"></i>`).join('')}</div>
+    <div class="pipe">${STAGES.map((s, i) =>
+      `<i class="${issue ? 'blocked' : (i <= idx ? 'done' : '')}"></i>`).join('')}</div>
     <div class="statnow"><b>${esc(stageOf(r))}</b>
       ${t(r[KEY.movedBy]) ? `<span class="assetno">${esc(r[KEY.movedBy])}${t(r[KEY.movedAt]) ? ' · ' + fmtWhen(r[KEY.movedAt]) : ''}</span>` : ''}</div>
     ${canStatus() ? `
@@ -1306,7 +1316,7 @@ function summarise(){
 function renderTodayStats(){
   const s = summarise();
   $('#todayStats').innerHTML =
-    `<div class="stat"><div class="n tnum">${s.done.toLocaleString('en-GB')}</div><div class="l">Verified at Oriel</div></div>
+    `<div class="stat"><div class="n tnum">${s.done.toLocaleString('en-GB')}</div><div class="l">Installed at Oriel</div></div>
      <div class="stat"><div class="n tnum">${(s.move - s.done).toLocaleString('en-GB')}</div><div class="l">Still to move</div></div>`;
   $('#bandMeta').textContent = ASSETS.size.toLocaleString('en-GB') + ' assets · ' + s.pct + '% moved';
 }
@@ -1338,13 +1348,13 @@ function renderDash(){
   <div class="stats">
     <div class="stat hero">
       <div class="n tnum">${s.pct}%</div>
-      <div class="l">${s.done.toLocaleString('en-GB')} of ${s.move.toLocaleString('en-GB')} transferring assets verified at Oriel</div>
+      <div class="l">${s.done.toLocaleString('en-GB')} of ${s.move.toLocaleString('en-GB')} transferring assets installed at Oriel</div>
       <div class="bigbar">
         <u class="d" style="width:${s.move ? s.done/s.move*100 : 0}%"></u>
         <u class="p" style="width:${s.move ? s.started/s.move*100 : 0}%"></u>
       </div>
       <div class="legend">
-        <span><b style="background:var(--lime)"></b>Verified ${s.done}</span>
+        <span><b style="background:var(--lime)"></b>Installed ${s.done}</span>
         <span><b style="background:var(--teal)"></b>In progress ${s.started}</span>
         <span><b style="background:rgba(255,255,255,.2)"></b>Not started ${s.move - s.done - s.started}</span>
       </div>
@@ -1465,6 +1475,269 @@ function renderFind(){
   paintLock();
 }
 
+/* ═══════════════════════════ .xlsx reader ═══════════════════════════
+   A .xlsx is a ZIP of XML. Browsers can already inflate (DecompressionStream) and
+   scan XML with a single pass, so this needs no library and no CDN request — the site
+   stays a single self-contained file.
+   Scope on purpose: reads one worksheet as text. It does not do formulas, styles,
+   dates or number formats, because the register is entirely text. */
+
+async function inflateRaw(bytes){
+  const ds = new DecompressionStream('deflate-raw');
+  const buf = await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+/** Reads the ZIP central directory — the authoritative index, unlike local headers
+    which may defer their sizes to a trailing data descriptor. */
+async function unzip(arrayBuffer){
+  const b = new Uint8Array(arrayBuffer);
+  const dv = new DataView(arrayBuffer);
+  let eocd = -1;
+  for(let i = b.length - 22; i >= Math.max(0, b.length - 66000); i--){
+    if(dv.getUint32(i, true) === 0x06054b50){ eocd = i; break; }
+  }
+  if(eocd < 0) throw new Error('That file is not a valid .xlsx (no ZIP directory).');
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  if(p === 0xffffffff) throw new Error('That .xlsx uses ZIP64, which this reader does not handle.');
+
+  const files = {};
+  for(let n = 0; n < count; n++){
+    if(dv.getUint32(p, true) !== 0x02014b50) break;
+    const method = dv.getUint16(p + 10, true);
+    const compSize = dv.getUint32(p + 20, true);
+    const nameLen = dv.getUint16(p + 28, true);
+    const extraLen = dv.getUint16(p + 30, true);
+    const cmtLen = dv.getUint16(p + 32, true);
+    const localAt = dv.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(b.subarray(p + 46, p + 46 + nameLen));
+    const lNameLen = dv.getUint16(localAt + 26, true);
+    const lExtraLen = dv.getUint16(localAt + 28, true);
+    const start = localAt + 30 + lNameLen + lExtraLen;
+    files[name] = { method, bytes: b.subarray(start, start + compSize) };
+    p += 46 + nameLen + extraLen + cmtLen;
+  }
+
+  const out = {};
+  for(const [name, f] of Object.entries(files)){
+    if(!/\.(xml|rels)$/i.test(name)) continue;              // skip images, printer settings
+    const raw = f.method === 0 ? f.bytes
+              : f.method === 8 ? await inflateRaw(f.bytes)
+              : null;
+    if(!raw) throw new Error('Unsupported compression in the .xlsx.');
+    out[name] = new TextDecoder().decode(raw);
+  }
+  return out;
+}
+
+const ENT = { amp:'&', lt:'<', gt:'>', quot:'"', apos:"'" };
+const dec = s => s.indexOf('&') < 0 ? s : s.replace(/&(#x?[0-9a-fA-F]+|amp|lt|gt|quot|apos);/g,
+  (m, e) => e[0] === '#'
+    ? String.fromCodePoint(e[1] === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10))
+    : (ENT[e] ?? m));
+
+const colOf = ref => {
+  let n = 0;
+  for(let i = 0; i < ref.length; i++){
+    const c = ref.charCodeAt(i);
+    if(c < 65 || c > 90) break;
+    n = n * 26 + (c - 64);
+  }
+  return n - 1;
+};
+
+/** Returns { cols, rows } for the named sheet, everything as strings.
+    Scanned with regexes rather than DOMParser: the sheet XML is 5 MB and building a
+    DOM for it takes ten seconds, where a single pass takes well under one. */
+async function readXlsxSheet(arrayBuffer, wanted){
+  const zip = await unzip(arrayBuffer);
+
+  const wbXml = zip['xl/workbook.xml'] || '';
+  const relXml = zip['xl/_rels/workbook.xml.rels'] || '';
+
+  const relMap = {};
+  for(const m of relXml.matchAll(/<Relationship\b[^>]*>/g)){
+    const id = /Id="([^"]+)"/.exec(m[0]), tg = /Target="([^"]+)"/.exec(m[0]);
+    if(id && tg) relMap[id[1]] = dec(tg[1]);
+  }
+
+  const sheets = [...wbXml.matchAll(/<sheet\b[^>]*\/?>/g)].map(m => ({
+    name: dec((/name="([^"]*)"/.exec(m[0]) || [,''])[1]),
+    rid: (/r:id="([^"]+)"/.exec(m[0]) || [,''])[1]
+  }));
+  const hit = sheets.find(s => s.name === wanted)
+           || sheets.find(s => s.name.trim().toLowerCase() === String(wanted).trim().toLowerCase());
+  if(!hit) throw new Error(`No sheet named "${wanted}". This workbook has: ${sheets.map(s => s.name).join(', ')}`);
+
+  const target = (relMap[hit.rid] || 'worksheets/sheet1.xml').replace(/^\/?xl\//, '').replace(/^\//, '');
+  const xml = zip['xl/' + target];
+  if(!xml) throw new Error('The worksheet is missing from the workbook.');
+
+  // Shared strings: one <si> per unique string, each possibly split across <t> runs.
+  const shared = [];
+  const ss = zip['xl/sharedStrings.xml'];
+  if(ss){
+    for(const si of ss.matchAll(/<si>([\s\S]*?)<\/si>/g)){
+      let s = '';
+      for(const tt of si[1].matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)) s += dec(tt[1]);
+      shared.push(s);
+    }
+  }
+
+  const grid = [];
+  let width = 0;
+  for(const rm of xml.matchAll(/<row\b([^>]*)>([\s\S]*?)<\/row>/g)){
+    const rn = /\br="(\d+)"/.exec(rm[1]);
+    const cells = [];
+    for(const cm of rm[2].matchAll(/<c\b([^>]*?)(\/>|>([\s\S]*?)<\/c>)/g)){
+      const attrs = cm[1], inner = cm[3] || '';
+      const rRef = /\br="([A-Z]+)/.exec(attrs);
+      const at = rRef ? colOf(rRef[1]) : cells.length;
+      const ty = (/\bt="([^"]+)"/.exec(attrs) || [,''])[1];
+      let val = '';
+      if(ty === 's'){
+        const v = /<v>([\s\S]*?)<\/v>/.exec(inner);
+        val = v ? (shared[+v[1]] ?? '') : '';
+      } else if(ty === 'inlineStr'){
+        for(const tt of inner.matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)) val += dec(tt[1]);
+      } else {
+        const v = /<v>([\s\S]*?)<\/v>/.exec(inner);
+        val = v ? dec(v[1]) : '';
+      }
+      if(at >= 0) cells[at] = String(val);
+    }
+    const idx = rn ? +rn[1] - 1 : grid.length;
+    grid[idx] = cells;
+    width = Math.max(width, cells.length);
+  }
+
+  const norm = grid.map(r => {
+    const a = r || [];
+    for(let i = 0; i < width; i++) if(a[i] == null) a[i] = '';
+    return a.slice(0, width);
+  });
+  const head = norm.shift() || [];
+  return {
+    // Headers are NOT trimmed. One of the register's columns genuinely ends in a
+    // space, and trimming it here would silently stop that column from matching.
+    cols: head.map(x => String(x ?? '')),
+    rows: norm.filter(r => r.some(c => String(c).trim() !== ''))
+             .map(r => r.map(c => String(c).trim()))
+  };
+}
+
+/* ═══════════════════════════ workbook import ═════════════════════════
+   You edit the workbook offline, bring it back, and this folds it into the Sheet.
+   Always previewed first: the server runs the whole merge without writing and reports
+   what would happen, and only writes once you confirm. */
+async function openImport(){
+  if(!canEdit()) return openUnlock('Unlock to import a workbook.');
+  if(!api.configured()) return toast('Connect the Google Sheet first');
+  openSheet(`
+    <h2>Import a workbook</h2>
+    <p class="sub">Reads the <b>Data</b> sheet of an .xlsx and updates the Google Sheet to match.
+      Nothing is written until you have seen what would change.</p>
+    <div id="impState"></div>
+    <input type="file" id="impFile" accept=".xlsx" style="display:none">
+    <button class="btn btn-primary" onclick="document.getElementById('impFile').click()">Choose a workbook</button>
+    <div style="height:10px"></div>
+    <button class="btn btn-quiet" onclick="closeSheet()">Cancel</button>
+    <p class="was" style="margin-top:12px">Move status, issues and photos are left alone — they are not in the workbook.
+      Assets in the Sheet but missing from the file are reported, never deleted.</p>`);
+  $('#impFile').onchange = e => stageImport(e.target.files[0]);
+}
+
+let pendingImport = null;
+
+async function stageImport(file){
+  if(!file) return;
+  const st = m => $('#impState').innerHTML = m;
+  try{
+    st(`<div class="viewnote"><span>Reading ${esc(file.name)}…</span></div>`);
+    const { cols, rows } = await readXlsxSheet(await file.arrayBuffer(), 'Data');
+    if(!cols.length || !rows.length) throw new Error('The Data sheet looks empty.');
+
+    st(`<div class="viewnote"><span>Comparing ${rows.length.toLocaleString('en-GB')} rows…</span></div>`);
+    const gz = await gzipB64(JSON.stringify({ c: cols, r: rows }));
+    pendingImport = { gz, filename: file.name, rows: rows.length };
+
+    const res = await api.post({ action:'import', key: session.key, by: session.name,
+                                 gz, filename: file.name, dryRun: true });
+    if(!res.ok) throw new Error(res.error || 'The sheet refused the import.');
+    showImportPreview(res);
+  }catch(e){
+    st('<div class="err">' + esc(e.message || 'Could not read that file.') + '</div>');
+  }
+}
+
+function showImportPreview(r){
+  const warn = [];
+  if(r.unknownColumns?.length)
+    warn.push(`${r.unknownColumns.length} column${r.unknownColumns.length===1?'':'s'} in the file are not in the Sheet and will be ignored: ${r.unknownColumns.slice(0,4).map(esc).join(', ')}`);
+  if(r.missingColumns?.length)
+    warn.push(`${r.missingColumns.length} Sheet column${r.missingColumns.length===1?'':'s'} are absent from the file and will be left as they are.`);
+  if(r.missingFromFile?.length)
+    warn.push(`${r.missingFromFile.length}${r.missingFromFile.length===60?'+':''} assets are in the Sheet but not in the file. They will be left alone, not deleted.`);
+
+  openSheet(`
+    <h2>Before it writes</h2>
+    <p class="sub">${esc(pendingImport.filename)} · ${r.rowsInFile.toLocaleString('en-GB')} rows read</p>
+    <div class="stats" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat"><div class="n tnum">${r.cellsChanged.toLocaleString('en-GB')}</div><div class="l">cells change</div></div>
+      <div class="stat"><div class="n tnum">${r.rowsChanged.toLocaleString('en-GB')}</div><div class="l">assets affected</div></div>
+      <div class="stat"><div class="n tnum" style="color:var(--go)">${r.newAssets.toLocaleString('en-GB')}</div><div class="l">new assets</div></div>
+    </div>
+    ${r.heldCount ? `<div class="banner">
+      <span><b>${r.heldCount} value${r.heldCount===1?'':'s'} edited in the app will be kept.</b>
+      The file still holds the old value, so it is probably older than the edit.</span></div>
+      <details class="more"><summary>Show them</summary>
+        ${r.held.map(x => `<div class="aud"><div class="w">${esc(x.id)} · ${esc(x.field)}</div>
+          <div class="chg">keeping <ins>${esc(x.app)}</ins>, file says <del>${esc(x.file)}</del></div></div>`).join('')}
+      </details>` : ''}
+    ${warn.map(wn => `<div class="viewnote"><span>${wn}</span></div>`).join('')}
+    ${r.cellsChanged === 0 && r.newAssets === 0
+      ? `<div class="viewnote"><span>Nothing to do — the Sheet already matches this file.</span></div>
+         <button class="btn btn-quiet" onclick="closeSheet()">Close</button>`
+      : `<div class="btn-row">
+          <button class="btn btn-quiet" onclick="closeSheet()">Cancel</button>
+          <button class="btn btn-primary" id="impGo">Apply to the Sheet</button>
+         </div>
+         ${r.heldCount ? `<div style="height:10px"></div>
+           <button class="btn btn-danger" onclick="runImport(true)">Apply and let the file overwrite my edits</button>` : ''}`}`);
+  const b = $('#impGo'); if(b) b.onclick = () => runImport(false);
+}
+
+async function runImport(letFileWin){
+  if(!pendingImport) return;
+  openSheet(`<h2>Importing…</h2><p class="sub">Writing to the Google Sheet. This can take a minute on a large change — do not close the page.</p><div class="spin"></div>`);
+  try{
+    const res = await api.post({ action:'import', key: session.key, by: session.name,
+                                 gz: pendingImport.gz, filename: pendingImport.filename,
+                                 letFileWin: !!letFileWin });
+    if(!res.ok) throw new Error(res.error || 'The import failed.');
+    pendingImport = null;
+    closeSheet();
+    toast(`Imported · ${res.cellsChanged.toLocaleString('en-GB')} cells, ${res.newAssets} new`);
+    REV = '0';
+    await refresh();
+    renderData();
+  }catch(e){
+    openSheet(`<h2>Import failed</h2><div class="err">${esc(e.message)}</div>
+      <p class="sub">Nothing partial is left behind on a refusal, but if it timed out mid-write, check the Sheet before retrying.</p>
+      <button class="btn btn-quiet" onclick="closeSheet()">Close</button>`);
+  }
+}
+
+async function gzipB64(str){
+  const cs = new CompressionStream('gzip');
+  const buf = await new Response(new Blob([str]).stream().pipeThrough(cs)).arrayBuffer();
+  const b = new Uint8Array(buf);
+  let s = '';
+  for(let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
 /* ═══════════════════════════ data / settings ═════════════════════════ */
 async function renderData(){
   const syncedAt = (await DB.get('meta','syncedAt'))?.v;
@@ -1516,7 +1789,9 @@ async function renderData(){
       <a class="linkrow" href="${sheetUrl}/export?format=xlsx" target="_blank" rel="noopener">Download as .xlsx<span class="arw">›</span></a>
       <a class="linkrow" href="${sheetUrl}#gid=0" target="_blank" rel="noopener">Open the audit log<span class="arw">›</span></a>`
       : `<p style="margin:0;color:var(--muted);font-size:14px">Connect the sheet to download the workbook.</p>`}
-    ${canEdit() ? `<button class="linkrow" onclick="openAdd()">Add an asset<span class="arw">›</span></button>` : ''}
+    ${canEdit() ? `<button class="linkrow" onclick="openAdd()">Add an asset<span class="arw">›</span></button>
+      <button class="linkrow" onclick="openImport()">Import an updated .xlsx<span class="arw">›</span></button>` : ''}
+    ${!canEdit() ? `<p class="was" style="margin-top:10px">Unlock to add assets or import a workbook.</p>` : ''}
   </div>
 
   <div class="card">
