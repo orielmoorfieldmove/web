@@ -423,6 +423,10 @@ const photoFor = r => {
   return (p && safeImg(p.url)) ? { ...p, url: safeImg(p.url) } : null;
 };
 let REV = '0', recent = [], apiUrl = '', sheetId = '';
+/* Result of the last health check. When the back end is not ready, the app says so
+   loudly rather than quietly serving the bundled snapshot as though it were live. */
+let HEALTH = null;
+let usingSnapshot = true;
 let route = 'scan', currentAsset = null, wedge = false, findLimit = 60;
 
 /* ══════════════════════════════ session ══════════════════════════════
@@ -605,12 +609,13 @@ async function boot(){
     (await DB.all('assets')).forEach(r => ASSETS.set(r._id, r));
     REV = (await DB.get('meta','rev'))?.v || '0';
   }
-  if(!ASSETS.size) await loadSeed();
+  if(!ASSETS.size) await loadSeed(); else usingSnapshot = !(await DB.get('meta','live'))?.v;
 
   reindex(); paintLock(); net(); render();
   go('scan');
 
-  if(api.configured()){ refresh({quiet:true}); drain(); loadPhotos(); }
+  if(api.configured()){ api.ping().then(r => { HEALTH = r; }).catch(()=>{});
+    refresh({quiet:true}); drain(); loadPhotos(); }
   else if(!localStorage.getItem('oriel.seenSetup')) setTimeout(promptSetup, 700);
 }
 
@@ -665,6 +670,8 @@ async function refresh(opts = {}){
     const buf = await new Response(new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
     const { c, r } = JSON.parse(new TextDecoder().decode(buf));
     await ingest(c, r, String(res.rev));
+    usingSnapshot = false;
+    await DB.put('meta', { k:'live', v:true });
     reindex();
     if(!opts.quiet) toast('Register updated · ' + ASSETS.size.toLocaleString('en-GB') + ' assets');
     render();
@@ -1371,7 +1378,8 @@ function renderTodayStats(){
   $('#todayStats').innerHTML =
     `<div class="stat"><div class="n tnum">${s.done.toLocaleString('en-GB')}</div><div class="l">Installed at Oriel</div></div>
      <div class="stat"><div class="n tnum">${(s.move - s.done).toLocaleString('en-GB')}</div><div class="l">Still to move</div></div>`;
-  $('#bandMeta').textContent = ASSETS.size.toLocaleString('en-GB') + ' assets · ' + s.pct + '% moved';
+  $('#bandMeta').textContent = (usingSnapshot && api.configured() ? '⚠ snapshot · ' : '') +
+    ASSETS.size.toLocaleString('en-GB') + ' assets · ' + s.pct + '% moved';
 }
 function groupBar(fn){
   const m = new Map();
@@ -1798,7 +1806,14 @@ async function renderData(){
   const connected = api.configured();
   const sheetUrl = sheetId ? 'https://docs.google.com/spreadsheets/d/' + sheetId : '';
 
+  const bad = HEALTH && HEALTH.ok === false;
   $('#s-data').innerHTML = `
+  ${usingSnapshot && connected ? `<div class="banner" style="background:#F6DCDD;color:var(--stop-d)">
+    <span><b>You are looking at the bundled snapshot, not your Google Sheet.</b>
+    Nothing you change here has reached the Sheet.</span>
+    <button onclick="runHealthCheck()">Check</button></div>` : ''}
+  ${bad ? `<div class="err"><b>The back end is not ready.</b><br>${esc(HEALTH.error || '')}</div>
+    ${HEALTH.fix ? `<div class="viewnote"><span>${esc(HEALTH.fix)}</span></div>` : ''}` : ''}
   <p class="eyebrow">Google Sheet</p>
   <div class="card">
     ${connected
@@ -1811,7 +1826,18 @@ async function renderData(){
           <dt>Revision</dt><dd><code class="k">${esc(REV)}</code></dd>
         </dl>
         <div style="height:12px"></div>
-        <button class="btn btn-primary" onclick="refresh()">Sync now</button>`
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="refresh()">Sync now</button>
+          <button class="btn btn-quiet" onclick="runHealthCheck()">Check connection</button>
+        </div>
+        ${HEALTH && HEALTH.checks ? `<div style="height:14px"></div>
+          <p class="eyebrow">Back end</p>
+          <dl class="kv">${Object.entries(HEALTH.checks).map(([k, v]) => {
+            const label = {spreadsheet:'Spreadsheet', dataSheet:'Data sheet', tracking:'Tracking columns',
+                           auditSheet:'_Audit tab', photosSheet:'_Photos tab', drive:'Drive (photos)'}[k] || k;
+            const good = v === 'ok';
+            return `<dt>${esc(label)}</dt><dd style="color:${good ? 'var(--go)' : 'var(--stop)'}">${good ? 'OK' : esc(v)}</dd>`;
+          }).join('')}</dl>` : ''}`
       : `<div class="err">Not connected. The app is running on the bundled snapshot and nothing can be saved.</div>
          <button class="btn btn-primary" onclick="promptSetup()">Connect the Google Sheet</button>`}
   </div>
@@ -1855,6 +1881,23 @@ async function renderData(){
   </div>`;
 }
 
+async function runHealthCheck(){
+  if(!api.configured()) return promptSetup();
+  toast('Checking the back end…');
+  try{
+    HEALTH = await api.ping();
+    if(HEALTH.sheetId){ sheetId = HEALTH.sheetId; localStorage.setItem('oriel.sheetId', sheetId); }
+    toast(HEALTH.ok
+      ? `Connected to "${HEALTH.sheetName}" · ${(HEALTH.rows || 0).toLocaleString('en-GB')} rows`
+      : 'The back end is not ready — see below');
+    if(HEALTH.ok){ REV = '0'; await refresh({ quiet:true }); }
+  }catch(e){
+    HEALTH = { ok:false, error:'Could not reach the script. Check the URL and that the deployment is set to "Anyone".' };
+    toast('Could not reach the script');
+  }
+  renderData();
+}
+
 function promptSetup(){
   localStorage.setItem('oriel.seenSetup','1');
   if(CONFIG.API_URL) return openSheet(`<h2>Already connected</h2>
@@ -1882,7 +1925,14 @@ function promptSetup(){
     const prev = apiUrl; apiUrl = url;
     try{
       const res = await api.ping();
-      if(!res.ok) throw new Error(res.error || 'The script returned an error.');
+      HEALTH = res;
+      if(!res.ok){
+        apiUrl = prev;
+        $('#apiGo').textContent = 'Connect'; $('#apiGo').disabled = false;
+        return $('#setupErr').innerHTML =
+          `<div class="err"><b>Reached the script, but it cannot use your Sheet.</b><br>${esc(res.error || '')}</div>` +
+          (res.fix ? `<div class="viewnote"><span>${esc(res.fix)}</span></div>` : '');
+      }
       localStorage.setItem('oriel.api', url);
       if(res.sheetId){ sheetId = res.sheetId; localStorage.setItem('oriel.sheetId', sheetId); }
       closeSheet(); toast('Connected — loading the register');
