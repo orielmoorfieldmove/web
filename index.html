@@ -4,12 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#173B5B">
-<meta name="description" content="Scan medical devices during the Moorfields to Oriel move: instant move / do-not-move answer, destination, and one-tap status.">
+<meta name="description" content="Scan medical devices during the Moorfields to Oriel move: instant move or do-not-move answer, destination, and one-tap status.">
 <meta name="robots" content="noindex,nofollow">
 <title>Oriel Move — Clinical Engineering</title>
-<link rel="manifest" href="./manifest.webmanifest">
-<link rel="icon" href="./assets/icon-192.png">
-<link rel="apple-touch-icon" href="./assets/icon-192.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' fill='%23173B5B'/%3E%3Cg fill='%23DDE460'%3E%3Ccircle cx='20' cy='5' r='2.4'/%3E%3Ccircle cx='30.6' cy='9.4' r='2.4'/%3E%3Ccircle cx='35' cy='20' r='2.4'/%3E%3Ccircle cx='30.6' cy='30.6' r='2.4'/%3E%3Ccircle cx='20' cy='35' r='2.4'/%3E%3Ccircle cx='9.4' cy='30.6' r='2.4'/%3E%3Ccircle cx='5' cy='20' r='2.4'/%3E%3Ccircle cx='9.4' cy='9.4' r='2.4'/%3E%3C/g%3E%3Ccircle cx='20' cy='20' r='6.4' fill='%233F8CA6'/%3E%3C/svg%3E">
 <style>
 :root{
   --navy:#173B5B; --navy-d:#0F2B44; --navy-l:#264065;
@@ -257,6 +255,16 @@ code.k{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--line-2
   animation:sk 1.2s linear infinite;border-radius:3px;height:14px}
 @keyframes sk{to{background-position:-200% 0}}
 
+/* ---------- model photos ---------- */
+.photo{display:block;width:100%;max-height:240px;object-fit:cover;object-position:center;
+  border-radius:var(--r);border:1px solid var(--line);background:var(--line-2);cursor:zoom-in}
+.photo.tall{max-height:62vh;object-fit:contain;cursor:default}
+.photo.broken{display:none}
+.photocap{font-size:12px;color:var(--muted);margin:7px 0 14px;font-weight:600}
+.photocap button{color:var(--indigo);text-decoration:underline;font-weight:700;font-size:12px}
+.res .thumb{flex:0 0 42px;width:42px;height:42px;border-radius:3px;object-fit:cover;
+  background:var(--line-2);border:1px solid var(--line)}
+
 </style>
 </head>
 <body>
@@ -382,6 +390,10 @@ const EDITABLE = [KEY.verdict, KEY.floor, KEY.to, KEY.service, KEY.handling,
                   KEY.oem, KEY.oemTest, KEY.notes];
 
 let COLS = [], ASSETS = new Map(), SERIALS = new Map();
+/* One photo per MODEL, not per asset — 436 models across 2,876 assets, so a picture of
+   "Pentacam HR" earns its keep on every Pentacam HR in the building. */
+let PHOTOS = {};
+const photoFor = r => PHOTOS[t(r[KEY.model]).toLowerCase()] || null;
 let REV = '0', recent = [], apiUrl = '', sheetId = '';
 let route = 'scan', currentAsset = null, wedge = false, findLimit = 60;
 
@@ -528,6 +540,7 @@ async function boot(){
   apiUrl = localStorage.getItem('oriel.api') || CONFIG.API_URL || '';
   sheetId = localStorage.getItem('oriel.sheetId') || '';
 
+  PHOTOS = (await DB.get('meta','photos'))?.v || {};
   const meta = await DB.get('meta','cols');
   if(meta){
     COLS = meta.v;
@@ -539,7 +552,7 @@ async function boot(){
   reindex(); paintLock(); net(); render();
   go('scan');
 
-  if(api.configured()){ refresh({quiet:true}); drain(); }
+  if(api.configured()){ refresh({quiet:true}); drain(); loadPhotos(); }
   else if(!localStorage.getItem('oriel.seenSetup')) setTimeout(promptSetup, 700);
 }
 
@@ -604,6 +617,114 @@ async function refresh(opts = {}){
   }catch(e){
     if(!opts.quiet) toast('Could not reach the sheet: ' + e.message);
   }
+}
+
+async function loadPhotos(){
+  if(!api.configured() || !navigator.onLine) return;
+  try{
+    const res = await api.get({ action:'photos', key: session?.key });
+    if(!res.ok) return;
+    PHOTOS = res.photos || {};
+    await DB.put('meta', { k:'photos', v:PHOTOS });
+    if(route === 'asset' && currentAsset) renderAsset(currentAsset);
+    if(route === 'find') renderFind();
+  }catch(e){ /* photos are a nicety; never block on them */ }
+}
+
+/** Shrink before upload. A phone photo is 4 MB; 1200px of JPEG is about 150 KB and is
+    more than enough to recognise a device across a room. */
+function shrink(file, max = 1200, quality = 0.82){
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onerror = () => rej(new Error('Could not read that file'));
+    fr.onload = () => {
+      const img = new Image();
+      img.onerror = () => rej(new Error('That file is not an image'));
+      img.onload = () => {
+        const scale = Math.min(1, max / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * scale);
+        c.height = Math.round(img.height * scale);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        res(c.toDataURL('image/jpeg', quality));
+      };
+      img.src = fr.result;
+    };
+    fr.readAsDataURL(file);
+  });
+}
+
+function openPhoto(model){
+  if(!canEdit()) return openUnlock('Unlock to add a model photo.');
+  const key = t(model).toLowerCase();
+  const has = PHOTOS[key];
+  const count = [...ASSETS.values()].filter(r => t(r[KEY.model]).toLowerCase() === key).length;
+  openSheet(`
+    <h2>${has ? 'Replace' : 'Add'} photo</h2>
+    <p class="sub"><b>${esc(model)}</b> — shown on all ${count} asset${count === 1 ? '' : 's'} of this model.</p>
+    <div id="photoErr"></div>
+    ${has ? `<img class="photo" src="${escA(has.url)}" alt="" style="margin-bottom:14px">` : ''}
+    <input type="file" id="photoFile" accept="image/*" capture="environment" style="display:none">
+    <button class="btn btn-primary" onclick="document.getElementById('photoFile').click()">Take or choose a photo</button>
+    <div style="height:14px"></div>
+    <label class="fld"><span class="lb">Or paste a link to an image</span>
+      <input id="photoUrl" placeholder="https://…" spellcheck="false" autocomplete="off"></label>
+    <div class="btn-row">
+      <button class="btn btn-quiet" onclick="closeSheet()">Cancel</button>
+      <button class="btn btn-teal" onclick="savePhotoUrl(${escA(JSON.stringify(model))})">Use this link</button>
+    </div>
+    ${has ? `<div style="height:10px"></div>
+      <button class="btn btn-danger" onclick="removePhoto(${escA(JSON.stringify(model))})">Remove this photo</button>` : ''}`);
+  $('#photoFile').onchange = e => uploadPhoto(model, e.target.files[0]);
+}
+
+async function uploadPhoto(model, file){
+  if(!file) return;
+  const err = m => { const e = $('#photoErr'); if(e) e.innerHTML = '<div class="err">' + esc(m) + '</div>'; };
+  try{
+    $('#photoErr').innerHTML = '<div class="viewnote"><span>Preparing the photo…</span></div>';
+    const dataUrl = await shrink(file);
+    $('#photoErr').innerHTML = '<div class="viewnote"><span>Uploading…</span></div>';
+    const res = await api.post({ action:'photo', key: session.key, by: session.name,
+                                 model, dataUrl, equipmentNo: currentAsset });
+    if(!res.ok) return err(res.error || 'The sheet refused the photo.');
+    PHOTOS[t(model).toLowerCase()] = { model, url: res.url, by: session.name, at: new Date().toISOString() };
+    await DB.put('meta', { k:'photos', v:PHOTOS });
+    closeSheet(); toast('Photo added');
+    if(currentAsset) renderAsset(currentAsset);
+  }catch(e){ err(e.message || 'Upload failed. Check your connection.'); }
+}
+
+async function savePhotoUrl(model){
+  const url = t($('#photoUrl').value);
+  const err = m => $('#photoErr').innerHTML = '<div class="err">' + esc(m) + '</div>';
+  if(!/^https:\/\//i.test(url)) return err('A photo link must start with https://');
+  try{
+    const res = await api.post({ action:'photo', key: session.key, by: session.name,
+                                 model, url, equipmentNo: currentAsset });
+    if(!res.ok) return err(res.error || 'The sheet refused the photo.');
+    PHOTOS[t(model).toLowerCase()] = { model, url: res.url, by: session.name, at: new Date().toISOString() };
+    await DB.put('meta', { k:'photos', v:PHOTOS });
+    closeSheet(); toast('Photo added');
+    if(currentAsset) renderAsset(currentAsset);
+  }catch(e){ err('Could not reach the sheet.'); }
+}
+
+async function removePhoto(model){
+  try{
+    await api.post({ action:'unphoto', key: session.key, by: session.name, model });
+    delete PHOTOS[t(model).toLowerCase()];
+    await DB.put('meta', { k:'photos', v:PHOTOS });
+    closeSheet(); toast('Photo removed');
+    if(currentAsset) renderAsset(currentAsset);
+  }catch(e){ toast('Could not remove the photo'); }
+}
+
+function zoomPhoto(url, caption){
+  openSheet(`<h2>${esc(caption)}</h2>
+    <img class="photo tall" src="${escA(url)}" alt="Photo of ${esc(caption)}">
+    <div style="height:12px"></div>
+    <button class="btn btn-quiet" onclick="closeSheet()">Close</button>`);
 }
 
 /* ══════════════════════════ write path + queue ═══════════════════════
@@ -911,6 +1032,7 @@ function toggleWedge(){
 function renderAsset(id){
   const r = ASSETS.get(id); if(!r) return;
   const v = verdictOf(r), dest = destOf(r), conflict = conflictOf(r), issue = issueOf(r);
+  const photo = photoFor(r);
   const slab = {
     move:   { word:'MOVE TO ORIEL', sub:'This asset transfers to the new hospital.' },
     nomove: { word:'DO NOT MOVE',   sub:'This asset stays. No move action required.' },
@@ -956,6 +1078,15 @@ function renderAsset(id){
     <div class="idrow"><div>
       <h1>${esc(r[KEY.model]) || '—'}</h1>
       <div class="assetno">${esc(r[KEY.brand])} · Asset ${esc(id)}</div></div></div>
+    ${photo
+      ? `<img class="photo" src="${escA(photo.url)}" alt="Photo of ${esc(r[KEY.model])}" loading="lazy"
+             onclick="zoomPhoto(${escA(JSON.stringify(photo.url))},${escA(JSON.stringify(t(r[KEY.model])))})"
+             onerror="this.classList.add('broken')">
+         <p class="photocap">Photo of this model${canEdit() ? ` · <button onclick="openPhoto(${escA(JSON.stringify(t(r[KEY.model])))})">Replace</button>` : ''}</p>`
+      : (canEdit() && t(r[KEY.model])
+          ? `<button class="btn btn-quiet" style="margin-bottom:14px" onclick="openPhoto(${escA(JSON.stringify(t(r[KEY.model])))})">
+               Add a photo of this model</button>`
+          : '')}
     <dl class="kv">
       <dt>Serial</dt><dd>${esc(r[KEY.serial]) || '—'}</dd>
       <dt>Category</dt><dd>${esc(r[KEY.cat]) || '—'}</dd>
@@ -1317,8 +1448,10 @@ function renderFind(){
   const tagTxt = { move:'Move', nomove:'Stay', unsure:'Hold', unknown:'?' };
   $('#findResults').innerHTML = out.map(r => {
     const v = verdictOf(r);
+    const ph = photoFor(r);
     return `<button class="res" onclick="go('asset','${esc(r._id)}')">
       <span class="flagbar" style="background:${colour[v]}"></span>
+      ${ph ? `<img class="thumb" src="${escA(ph.url)}" alt="" loading="lazy" onerror="this.remove()">` : ''}
       <span class="body">
         <span class="l1">${esc(r[KEY.model]) || esc(r._id)}</span>
         <span class="l2">${esc(r._id)} · ${esc(r[KEY.from]) || '—'}${v === 'move' && destOf(r) ? ' → ' + esc(destOf(r)) : ''}</span>
@@ -1348,6 +1481,7 @@ async function renderData(){
           <dt>Assets</dt><dd class="tnum">${ASSETS.size.toLocaleString('en-GB')}</dd>
           <dt>Columns</dt><dd class="tnum">${COLS.length}</dd>
           <dt>Last sync</dt><dd>${syncedAt ? fmtWhen(syncedAt) : 'never'}</dd>
+          <dt>Model photos</dt><dd class="tnum">${Object.keys(PHOTOS).length}</dd>
           <dt>Revision</dt><dd><code class="k">${esc(REV)}</code></dd>
         </dl>
         <div style="height:12px"></div>
@@ -1421,6 +1555,7 @@ function promptSetup(){
       closeSheet(); toast('Connected — loading the register');
       REV = '0';
       await refresh();
+      await loadPhotos();
       renderData();
     }catch(e){
       apiUrl = prev;
@@ -1467,11 +1602,9 @@ $$('.tabs button, [data-goto]').forEach(b => b.addEventListener('click', () => g
 document.addEventListener('click', e => {
   if(wedge && route === 'scan' && !e.target.closest('button,input,select,textarea,a')) $('#scanInput').focus();
 });
-addEventListener('visibilitychange', () => { if(!document.hidden && api.configured()) { drain(); refresh({quiet:true}); } });
-
-if('serviceWorker' in navigator) {
-  addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
-}
+addEventListener('visibilitychange', () => {
+  if(!document.hidden && api.configured()){ drain(); refresh({ quiet:true }); loadPhotos(); }
+});
 
 boot().catch(e => {
   document.querySelector('main').innerHTML =
