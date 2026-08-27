@@ -1533,6 +1533,14 @@ function renderFind(){
     (n > out.length ? ' · showing ' + out.length : '');
   const colour = { move:'var(--go)', nomove:'var(--stop)', unsure:'var(--hold)', unknown:'var(--navy-l)' };
   const tagTxt = { move:'Move', nomove:'Stay', unsure:'Hold', unknown:'?' };
+  /* For a moving asset the tag shows how far along it is, so a list of 2,629 "Move"
+     rows is still scannable. Colour tracks progress; the bar on the left keeps showing
+     the move / stay / hold decision. */
+  const stageTag = {
+    'Not started': { txt:'To do',   bg:'var(--navy-l)' },
+    'In transit':  { txt:'Moving',  bg:'var(--teal)'   },
+    'Installed':   { txt:'Done',    bg:'var(--go)'     }
+  };
   $('#findResults').innerHTML = out.map(r => {
     const v = verdictOf(r);
     const ph = photoFor(r);
@@ -1543,8 +1551,12 @@ function renderFind(){
         <span class="l1">${esc(r[KEY.model]) || esc(r._id)}</span>
         <span class="l2">${esc(r._id)} · ${esc(r[KEY.from]) || '—'}${v === 'move' && destOf(r) ? ' → ' + esc(destOf(r)) : ''}</span>
       </span>
-      <span class="tag" style="background:${colour[v]};color:#fff">${
-        issueOf(r) ? 'Issue' : (v === 'move' ? stageOf(r).split(' ')[0] : tagTxt[v])}</span>
+      ${(() => {
+        if(issueOf(r)) return `<span class="tag" style="background:var(--stop);color:#fff">Issue</span>`;
+        if(v !== 'move') return `<span class="tag" style="background:${colour[v]};color:#fff">${tagTxt[v]}</span>`;
+        const st = stageTag[stageOf(r)] || stageTag['Not started'];
+        return `<span class="tag" style="background:${st.bg};color:#fff">${st.txt}</span>`;
+      })()}
     </button>`;
   }).join('') || `<div class="empty"><h3>No assets match</h3><p>Clear a filter or widen the search.</p></div>`;
   if(n > out.length)
