@@ -389,9 +389,17 @@ code.k{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--line-2
 
 /* ─────────────────────────── configure this ─────────────────────────── */
 const CONFIG = {
-  // Paste your Apps Script web app /exec URL here after deploying.
-  // Leave blank to run on the bundled snapshot in read-only demo mode.
-  API_URL: '',
+  /* The Apps Script deployment this site talks to. Baked in, so any device that opens
+     the page is connected immediately — nothing to paste, nothing to set up.
+
+     Pinned on purpose: when this is set it OVERRIDES anything in localStorage, so
+     nothing running in the browser can redirect the next unlock to somewhere else and
+     collect the master key as it is typed. See SECURITY.md.
+
+     Changing deployment? Publish a NEW VERSION of the existing deployment instead —
+     that keeps this URL working. "New deployment" issues a different URL and you would
+     have to edit this line and re-push. */
+  API_URL: 'https://script.google.com/macros/s/AKfycbyvz06N0Nh5AtcrKpDRxO6B3ZVtnEP2f0UdfRIN6h8XDzZGDOUXyVkZ0t1BduPKSWSdZw/exec',
   ORG: 'Moorfields Eye Hospital NHS Foundation Trust'
 };
 /* ─────────────────────────────────────────────────────────────────────── */
