@@ -273,14 +273,24 @@ code.k{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--line-2
 @keyframes sk{to{background-position:-200% 0}}
 
 /* ---------- model photos ---------- */
-.photo{display:block;width:100%;max-height:240px;object-fit:cover;object-position:center;
-  border-radius:var(--r);border:1px solid var(--line);background:var(--line-2);cursor:zoom-in}
-.photo.tall{max-height:62vh;object-fit:contain;cursor:default}
+/* contain, not cover. Medical device shots are tall portraits on a white background —
+   cover crops the head or the base off exactly the part you need to recognise it. */
+.photo{display:block;width:100%;height:auto;max-height:300px;object-fit:contain;
+  border-radius:var(--r);border:1px solid var(--line);background:#fff;padding:10px;cursor:zoom-in}
+.photo.tall{max-height:64vh;padding:0;border:0;cursor:default}
 .photo.broken{display:none}
 .photocap{font-size:12px;color:var(--muted);margin:7px 0 14px;font-weight:600}
 .photocap button{color:var(--indigo);text-decoration:underline;font-weight:700;font-size:12px}
-.res .thumb{flex:0 0 42px;width:42px;height:42px;border-radius:3px;object-fit:cover;
-  background:var(--line-2);border:1px solid var(--line)}
+.res .thumb{flex:0 0 42px;width:42px;height:42px;border-radius:3px;object-fit:contain;
+  background:#fff;border:1px solid var(--line);padding:2px}
+
+/* Bottom-of-page return. The one at the top scrolls away on a long asset, and on a
+   phone the thumb is at the bottom of the screen anyway. */
+.scanback{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;
+  min-height:52px;margin:4px 0 20px;padding:14px;border-radius:var(--r);
+  background:var(--navy);color:#fff;font-weight:700;font-size:16px}
+.scanback:active{background:var(--navy-d)}
+.scanback svg{width:19px;height:19px}
 
 </style>
 </head>
@@ -1195,7 +1205,13 @@ function renderAsset(id){
   <div class="btn-row" style="margin-bottom:12px">
     ${canEdit() ? `<button class="btn btn-ghost" onclick="openEdit(${jsArg(id)})">Edit details</button>` : ''}
     <button class="btn btn-quiet" onclick="openHistory(${jsArg(id)})">History</button>
-  </div>`;
+  </div>
+
+  <button class="scanback" onclick="go('scan')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M3 8V5a2 2 0 012-2h3M16 3h3a2 2 0 012 2v3M21 16v3a2 2 0 01-2 2h-3M8 21H5a2 2 0 01-2-2v-3M3 12h18"/>
+    </svg>Scan another asset
+  </button>`;
   renderRecent();
 }
 
