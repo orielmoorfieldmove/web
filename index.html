@@ -498,6 +498,11 @@ function saveSession(s){
   paintLock();
 }
 const cred = () => session && (session.token || session.key);
+/* When the deployment allows keyless batch updates, anyone can advance a status —
+   they just have to say who they are, so the audit log is never anonymous. */
+const openBatch = () => !!(HEALTH && HEALTH.openBatch);
+const canBatch  = () => canStatus() || openBatch();
+const whoAmI    = () => (session && session.name) || t(localStorage.getItem('oriel.name'));
 const canEdit   = () => !!(session && session.canEdit);
 const canStatus = () => !!(session && session.canStatus);
 
@@ -849,7 +854,8 @@ function zoomPhoto(url, caption){
    then queued. The queue drains in order, oldest first, and each operation carries a
    clientId so a replay after a dropped connection cannot apply twice. */
 async function submit(op, optimistic){
-  if(!session) { openUnlock(); return false; }
+  const keyless = op.action === 'bulkStage' && openBatch();
+  if(!session && !keyless) { openUnlock(); return false; }
   const item = { clientId: uuid(), op, occurredAt: new Date().toISOString(), attempts: 0 };
   if(optimistic) { await DB.put('assets', optimistic); }
   await DB.put('queue', item);
@@ -860,19 +866,25 @@ async function submit(op, optimistic){
 
 let draining = false;
 async function drain(){
-  if(draining || !navigator.onLine || !api.configured() || !session) return;
+  if(draining || !navigator.onLine || !api.configured()) return;
+  const items0 = await DB.all('queue');
+  if(!items0.length) return;
+  // Without a session we can still send keyless batch updates; anything else waits.
+  if(!session && !(openBatch() && items0.every(i => i.op.action === 'bulkStage'))) return;
   draining = true;
   try{
     const items = (await DB.all('queue')).sort((a,b) => a.occurredAt.localeCompare(b.occurredAt));
     if(!items.length) return;
     const res = await api.post({
-      action: 'batch', key: cred(), by: session.name,
+      action: 'batch', key: cred(), by: whoAmI() || 'unknown',
       ops: items.map(i => {
         const { _localId, ...op } = i.op;          // client-only hint, never sent
         return { ...op, clientId: i.clientId, occurredAt: i.occurredAt };
       })
     });
     if(!res.ok){
+      if(res.code === 'NEED_NAME'){ askName(); return; }
+      if(res.code === 'RATE'){ toast(res.error); return; }
       if(res.code === 'BAD_KEY' || res.code === 'LOCKED'){
         saveSession(null);
         toast('Your session has ended. Unlock again to send ' +
@@ -1292,9 +1304,13 @@ function renderBatch(){
           }).join('')}
         </div>
 
-        ${canStatus()
+        ${canBatch()
           ? `<button class="btn btn-go" ${willChange ? '' : 'disabled'}
-               onclick="batchApply()">Mark ${willChange} as ${esc(batchTarget.toLowerCase())}</button>`
+               onclick="batchApply()">Mark ${willChange} as ${esc(batchTarget.toLowerCase())}</button>
+             ${!canStatus() ? `<p class="was" style="margin-top:9px">Signed in as
+               <b>${esc(whoAmI() || 'not set')}</b>${whoAmI()
+                 ? ` · <button onclick="askName(true)" style="text-decoration:underline;color:var(--indigo);font-weight:700">change</button>`
+                 : ''}. Your name goes on every change.</p>` : ''}`
           : `<button class="btn btn-primary" onclick="openUnlock('Enter your move-team key to update statuses.')">
                Unlock to mark ${willChange} as ${esc(batchTarget.toLowerCase())}</button>
              <p class="was" style="margin-top:9px">Scanning works without a key. Sending the update needs one,
@@ -1305,7 +1321,8 @@ function renderBatch(){
 }
 
 async function batchApply(){
-  if(!canStatus()) return openUnlock('Unlock to update move status.');
+  if(!canBatch()) return openUnlock('Unlock to update move status.');
+  if(!canStatus() && !whoAmI()) return askName();
   const { ok, blocked } = batchSplit();
   const targets = ok.filter(r => stageOf(r) !== batchTarget);
   if(!targets.length) return toast('Nothing to change');
@@ -1321,14 +1338,40 @@ async function batchApply(){
     </div>`);
 }
 
+/** No key needed, but we still need to know who. One question, remembered on the device. */
+function askName(changing){
+  openSheet(`
+    <h2>Who is doing this?</h2>
+    <p class="sub">No password needed. Your name goes on every status change so the register
+      shows who moved what.</p>
+    <label class="fld"><span class="lb">Name or team</span>
+      <input id="nmIn" autocomplete="name" placeholder="e.g. Dave — Britannia Movers"
+             value="${escA(whoAmI())}"></label>
+    <div class="btn-row">
+      <button class="btn btn-quiet" onclick="closeSheet()">Cancel</button>
+      <button class="btn btn-primary" id="nmGo">${changing ? 'Save' : 'Continue'}</button>
+    </div>`);
+  const save = () => {
+    const v = t($('#nmIn').value);
+    if(v.length < 2) return toast('Please put a name in');
+    localStorage.setItem('oriel.name', v);
+    closeSheet(); renderBatch();
+    if(!changing) batchApply();
+  };
+  $('#nmGo').onclick = save;
+  $('#nmIn').addEventListener('keydown', e => { if(e.key === 'Enter') save(); });
+  setTimeout(() => $('#nmIn').focus(), 120);
+}
+
 async function batchCommit(){
   const { ok } = batchSplit();
   const targets = ok.filter(r => stageOf(r) !== batchTarget);
   const ids = targets.map(r => r._id);
   const when = new Date().toISOString();
 
+  const who = whoAmI() || 'unknown';
   for(const r of targets){
-    ASSETS.set(r._id, { ...r, [KEY.stage]: batchTarget, [KEY.movedAt]: when, [KEY.movedBy]: session.name });
+    ASSETS.set(r._id, { ...r, [KEY.stage]: batchTarget, [KEY.movedAt]: when, [KEY.movedBy]: who });
   }
   await DB.putMany('assets', targets.map(r => ASSETS.get(r._id)));
   await submit({ action:'bulkStage', ids, stage: batchTarget, reason:'Bulk update' });
