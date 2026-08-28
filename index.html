@@ -292,6 +292,30 @@ code.k{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--line-2
 .scanback:active{background:var(--navy-d)}
 .scanback svg{width:19px;height:19px}
 
+/* ---------- batch scanning ---------- */
+.batchbar{display:flex;align-items:center;gap:10px;background:var(--lime);color:var(--navy-d);
+  border-radius:var(--r);padding:12px 14px;margin-bottom:12px;font-weight:700;font-size:14px}
+.batchbar .n{font-size:24px;letter-spacing:-.02em;line-height:1}
+.batchbar button{margin-left:auto;flex:0 0 auto;font-weight:700;font-size:13px;
+  text-decoration:underline;color:var(--navy-d)}
+.batchlist{max-height:46vh;overflow:auto;-webkit-overflow-scrolling:touch;margin-bottom:12px}
+.brow{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--line-2)}
+.brow:first-child{border-top:0}
+.brow .bar{width:4px;align-self:stretch;border-radius:2px;flex:0 0 4px;height:auto;background:var(--go);margin:0}
+.brow .b{min-width:0;flex:1}
+.brow .b1{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brow .b2{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brow .x{flex:0 0 auto;width:30px;height:30px;border-radius:var(--r);display:grid;place-items:center;
+  color:var(--muted);font-size:19px;line-height:1}
+.brow.bad .b1{color:var(--stop)}
+.brow.bad .bar{background:var(--stop)}
+.batchtarget{display:flex;gap:8px;margin-bottom:10px}
+.batchtarget button{flex:1;padding:12px 6px;border-radius:var(--r);border:1px solid var(--line);
+  background:#fff;font-weight:700;font-size:13.5px;color:var(--navy);min-height:52px}
+.batchtarget button.sel{background:var(--navy);border-color:var(--navy);color:#fff}
+.bwarn{background:#FFF6D9;border:1px solid #E6D08A;color:#6B5200;border-radius:var(--r);
+  padding:10px 12px;font-size:13px;font-weight:600;margin-bottom:10px}
+
 </style>
 </head>
 <body>
@@ -336,8 +360,10 @@ code.k{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--line-2
       </div>
       <div style="margin-top:10px">
         <button class="chip sm" id="btnWedge" style="background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.3);color:#fff">Handheld scanner</button>
+        <button class="chip sm" id="btnBatch" style="background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.3);color:#fff">Batch mode</button>
       </div>
     </div>
+    <div id="batchPanel" class="hide"></div>
     <div id="recentWrap" class="hide">
       <p class="eyebrow">Recently scanned</p>
       <div class="recent" id="recent"></div>
@@ -446,6 +472,10 @@ let REV = '0', recent = [], apiUrl = '', sheetId = '';
 let HEALTH = null;
 let usingSnapshot = true;
 let route = 'scan', currentAsset = null, wedge = false, findLimit = 60;
+/* Batch scanning. `batch` holds ids only — models and statuses are read live, so the
+   list never shows a stale status after a sync. Persisted, because losing forty scans
+   to a dropped phone is the whole reason people go back to paper. */
+let batchMode = false, batch = [], batchTarget = 'In transit', lastScan = { code:'', at:0 };
 
 /* ══════════════════════════════ session ══════════════════════════════
    The unlock lives in sessionStorage. That means: it survives a page refresh and
@@ -628,6 +658,8 @@ async function boot(){
     REV = (await DB.get('meta','rev'))?.v || '0';
   }
   if(!ASSETS.size) await loadSeed(); else usingSnapshot = !(await DB.get('meta','live'))?.v;
+  const bm = await DB.get('meta','batch');
+  if(bm){ batch = bm.v.ids || []; batchMode = !!bm.v.on; batchTarget = bm.v.target || 'In transit'; }
 
   reindex(); paintLock(); net(); render();
   go('scan');
@@ -960,7 +992,9 @@ function paintLock(){
   const b = $('#lockBtn'), l = $('#lockLabel'), i = $('#lockIcon');
   const open = !!session;
   b.classList.toggle('open', open);
-  l.textContent = open ? (session.name.split(' ')[0] + ' · editing') : 'View only';
+  l.textContent = open
+    ? session.name.split(' ')[0] + ' · ' + (session.canEdit ? 'editing' : 'move team')
+    : 'View only';
   i.innerHTML = open
     ? '<rect x="5" y="11" width="14" height="9" rx="1.6"/><path d="M8 11V7.5a4 4 0 017.4-2"/>'
     : '<rect x="5" y="11" width="14" height="9" rx="1.6"/><path d="M8 11V7.5a4 4 0 018 0V11"/>';
@@ -980,7 +1014,10 @@ function openUnlock(why){
       <input id="uKey" class="keyin" autocomplete="off" autocapitalize="characters"
              spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX"></label>
     <button class="btn btn-primary" id="uGo">Unlock</button>
-    <p class="was" style="margin-top:12px">Stays unlocked in this tab, including through a page refresh. Closing the tab locks it again.</p>`);
+    <p class="was" style="margin-top:12px">Your key decides what you can do. A move-team key allows
+      scanning, batch status updates and issue reports. A Clinical Engineering key also allows editing
+      records, adding assets, photos and workbook imports.</p>
+    <p class="was">Stays unlocked in this tab, including through a page refresh. Closing the tab locks it again.</p>`);
   const go = () => doUnlock();
   $('#uGo').onclick = go;
   $('#uKey').addEventListener('keydown', e => { if(e.key === 'Enter') go(); });
@@ -1006,10 +1043,12 @@ async function doUnlock(){
     saveSession({ token: res.token, name, role: res.role,
                   canEdit: !!res.canEdit, canStatus: !!res.canStatus, at: Date.now() });
     closeSheet(); buzz();
-    toast('Editing unlocked · ' + res.role);
+    toast(res.canEdit ? 'Unlocked · Clinical Engineering' : 'Unlocked · move team, status updates only');
     drain();
+    render();                       // batch panel, header chip and stats all change with the role
     if(route === 'asset' && currentAsset) renderAsset(currentAsset);
     if(route === 'data') renderData();
+    if(route === 'find') renderFind();
   }catch(e){
     $('#uGo').textContent = 'Unlock'; $('#uGo').disabled = false;
     err('Could not reach the sheet. Check your connection and the web app URL.');
@@ -1026,8 +1065,13 @@ async function openLockDown(){
     <div style="height:10px"></div>
     <button class="btn btn-danger" onclick="lockNow()">Lock — back to view only</button>`);
 }
-function lockNow(){ saveSession(null); closeSheet(); toast('Locked · view only');
-  if(route === 'asset' && currentAsset) renderAsset(currentAsset); if(route === 'data') renderData(); }
+function lockNow(){
+  saveSession(null); closeSheet(); toast('Locked · view only');
+  render();
+  if(route === 'asset' && currentAsset) renderAsset(currentAsset);
+  if(route === 'data') renderData();
+  if(route === 'find') renderFind();
+}
 
 /* ═══════════════════════════════ routing ═════════════════════════════ */
 function go(r, arg){
@@ -1045,7 +1089,8 @@ function go(r, arg){
   if(r === 'dash') renderDash();
   if(r === 'find') renderFind();
   if(r === 'data') renderData();
-  if(r === 'scan'){ renderTodayStats(); renderRecent(); if(wedge) setTimeout(()=>$('#scanInput').focus(), 80); }
+  if(r === 'scan'){ renderTodayStats(); renderRecent(); renderBatch();
+    if(wedge) setTimeout(()=>$('#scanInput').focus(), 80); }
   paintLock();
   window.scrollTo(0,0);
 }
@@ -1058,6 +1103,7 @@ function lookup(raw){
       || (SERIALS.has(s.toUpperCase()) ? ASSETS.get(SERIALS.get(s.toUpperCase())) : null);
 }
 function doScan(raw){
+  if(batchMode){ $('#scanInput').value = ''; return batchAdd(raw); }
   const rec = lookup(raw);
   if(!rec){
     buzz([60,60,60]);
@@ -1099,7 +1145,12 @@ async function startCam(){
   const v = $('#cam'); v.srcObject = camStream; await v.play();
   const det = new BarcodeDetector({ formats:['code_128','code_39','qr_code','ean_13','data_matrix','codabar','itf'] });
   camLoop = setInterval(async () => {
-    try { const codes = await det.detect(v); if(codes.length) doScan(codes[0].rawValue); } catch {}
+    try {
+      const codes = await det.detect(v);
+      // In batch mode the camera stays on and keeps collecting; batchAdd debounces
+      // repeat reads of the same label.
+      if(codes.length) doScan(codes[0].rawValue);
+    } catch {}
   }, 320);
 }
 function stopCam(){
@@ -1114,6 +1165,179 @@ function toggleWedge(){
   $('#btnWedge').textContent = wedge ? 'Handheld scanner on' : 'Handheld scanner';
   if(wedge) $('#scanInput').focus(); else $('#scanInput').blur();
   toast(wedge ? 'Scan box will stay ready' : 'Handheld mode off');
+}
+
+/* ═══════════════════════════ batch scanning ═════════════════════════
+   Scan a trolley-load, then set them all at once. Built for the move itself, where
+   somebody is standing in a corridor with forty items and no patience. */
+
+async function saveBatch(){
+  await DB.put('meta', { k:'batch', v:{ ids:batch, on:batchMode, target:batchTarget } });
+}
+
+function toggleBatch(){
+  batchMode = !batchMode;
+  $('#btnBatch').classList.toggle('sel', batchMode);
+  $('#btnBatch').textContent = batchMode ? 'Batch mode on' : 'Batch mode';
+  saveBatch(); renderBatch();
+  toast(batchMode ? 'Scans will collect in a list' : 'Back to single scanning');
+}
+
+/** A short click, so you know a scan landed without looking at the screen. */
+function blip(ok){
+  try{
+    const C = window.AudioContext || window.webkitAudioContext; if(!C) return;
+    blip.ctx = blip.ctx || new C();
+    const o = blip.ctx.createOscillator(), g = blip.ctx.createGain();
+    o.frequency.value = ok ? 880 : 220;
+    g.gain.value = 0.06;
+    o.connect(g); g.connect(blip.ctx.destination);
+    o.start(); o.stop(blip.ctx.currentTime + (ok ? 0.07 : 0.22));
+  }catch(e){}
+}
+
+function batchAdd(raw){
+  const code = t(raw);
+  // The camera fires several times a second; ignore the same code for two seconds.
+  if(code === lastScan.code && Date.now() - lastScan.at < 2000) return;
+  lastScan = { code, at: Date.now() };
+
+  const rec = lookup(code);
+  if(!rec){
+    blip(false); buzz([60,60,60]);
+    toast('Not in the register: ' + code);
+    return;
+  }
+  if(batch.includes(rec._id)){
+    blip(false); buzz([30]);
+    toast('Already scanned · ' + (t(rec[KEY.model]) || rec._id));
+    return;
+  }
+  batch = [rec._id, ...batch];
+  blip(true); buzz();
+  saveBatch(); renderBatch();
+}
+
+function batchRemove(id){ batch = batch.filter(x => x !== id); saveBatch(); renderBatch(); }
+function batchSetTarget(s){ batchTarget = s; saveBatch(); renderBatch(); }
+
+function batchClear(){
+  if(!batch.length) return;
+  openSheet(`<h2>Clear ${batch.length} scanned asset${batch.length === 1 ? '' : 's'}?</h2>
+    <p class="sub">Nothing has been sent to the Sheet yet, so this just empties the list.</p>
+    <div class="btn-row">
+      <button class="btn btn-quiet" onclick="closeSheet()">Keep them</button>
+      <button class="btn btn-danger" onclick="closeSheet();batch=[];saveBatch();renderBatch()">Clear</button>
+    </div>`);
+}
+
+/** Split the list into what can actually be advanced and what cannot. */
+function batchSplit(){
+  const ok = [], blocked = [];
+  for(const id of batch){
+    const r = ASSETS.get(id);
+    if(!r) continue;
+    if(batchTarget !== STAGES[0] && verdictOf(r) !== 'move')
+      blocked.push({ r, why: { nomove:'Do not move', unsure:'On hold', unknown:'No decision' }[verdictOf(r)] });
+    else ok.push(r);
+  }
+  return { ok, blocked };
+}
+
+function renderBatch(){
+  const panel = $('#batchPanel');
+  if(!panel) return;
+  if(!batchMode){ panel.classList.add('hide'); panel.innerHTML = ''; return; }
+  panel.classList.remove('hide');
+
+  const { ok, blocked } = batchSplit();
+  const already = ok.filter(r => stageOf(r) === batchTarget).length;
+  const willChange = ok.length - already;
+
+  panel.innerHTML = `
+    <div class="batchbar">
+      <span class="n tnum">${batch.length}</span>
+      <span>scanned</span>
+      ${batch.length ? `<button onclick="batchClear()">Clear all</button>` : ''}
+    </div>
+
+    ${batch.length ? `
+      <div class="card tight">
+        <p class="eyebrow">Set all of these to</p>
+        <div class="batchtarget">
+          ${STAGES.map(s => `<button class="${s === batchTarget ? 'sel' : ''}"
+            onclick="batchSetTarget(${jsArg(s)})">${esc(s)}</button>`).join('')}
+        </div>
+
+        ${blocked.length ? `<div class="bwarn">${blocked.length} of these will be left alone —
+          the register says they are not transferring. They stay in the list so you can see which.</div>` : ''}
+        ${already ? `<div class="bwarn">${already} ${already === 1 ? 'is' : 'are'} already
+          "${esc(batchTarget)}" and will be skipped.</div>` : ''}
+
+        <div class="batchlist">
+          ${batch.map(id => {
+            const r = ASSETS.get(id);
+            if(!r) return '';
+            const bad = batchTarget !== STAGES[0] && verdictOf(r) !== 'move';
+            return `<div class="brow ${bad ? 'bad' : ''}">
+              <span class="bar"></span>
+              <span class="b">
+                <span class="b1">${esc(r[KEY.model]) || esc(id)}</span>
+                <span class="b2">${esc(id)} · ${bad
+                  ? esc({ nomove:'Do not move', unsure:'On hold', unknown:'No decision' }[verdictOf(r)])
+                  : esc(stageOf(r))}</span>
+              </span>
+              <button class="x" onclick="batchRemove(${jsArg(id)})" aria-label="Remove">×</button>
+            </div>`;
+          }).join('')}
+        </div>
+
+        ${canStatus()
+          ? `<button class="btn btn-go" ${willChange ? '' : 'disabled'}
+               onclick="batchApply()">Mark ${willChange} as ${esc(batchTarget.toLowerCase())}</button>`
+          : `<button class="btn btn-primary" onclick="openUnlock('Enter your move-team key to update statuses.')">
+               Unlock to mark ${willChange} as ${esc(batchTarget.toLowerCase())}</button>
+             <p class="was" style="margin-top:9px">Scanning works without a key. Sending the update needs one,
+               so every change carries a name.</p>`}
+      </div>`
+    : `<div class="card tight"><p style="margin:0;color:var(--muted);font-size:14px">
+        Scan assets and they will collect here. Nothing is sent until you press the button.</p></div>`}`;
+}
+
+async function batchApply(){
+  if(!canStatus()) return openUnlock('Unlock to update move status.');
+  const { ok, blocked } = batchSplit();
+  const targets = ok.filter(r => stageOf(r) !== batchTarget);
+  if(!targets.length) return toast('Nothing to change');
+
+  openSheet(`
+    <h2>Mark ${targets.length} asset${targets.length === 1 ? '' : 's'} as ${esc(batchTarget.toLowerCase())}?</h2>
+    <p class="sub">Recorded against your name, one audit entry each.</p>
+    ${blocked.length ? `<div class="bwarn">${blocked.length} scanned asset${blocked.length === 1 ? '' : 's'}
+      will be left alone: ${blocked.slice(0,4).map(b => esc(b.r._id) + ' (' + esc(b.why) + ')').join(', ')}${blocked.length > 4 ? '…' : ''}</div>` : ''}
+    <div class="btn-row">
+      <button class="btn btn-quiet" onclick="closeSheet()">Cancel</button>
+      <button class="btn btn-go" onclick="closeSheet();batchCommit()">Confirm</button>
+    </div>`);
+}
+
+async function batchCommit(){
+  const { ok } = batchSplit();
+  const targets = ok.filter(r => stageOf(r) !== batchTarget);
+  const ids = targets.map(r => r._id);
+  const when = new Date().toISOString();
+
+  for(const r of targets){
+    ASSETS.set(r._id, { ...r, [KEY.stage]: batchTarget, [KEY.movedAt]: when, [KEY.movedBy]: session.name });
+  }
+  await DB.putMany('assets', targets.map(r => ASSETS.get(r._id)));
+  await submit({ action:'bulkStage', ids, stage: batchTarget, reason:'Bulk update' });
+
+  buzz([20,50,20]); blip(true);
+  toast(ids.length + ' marked ' + batchTarget.toLowerCase());
+  batch = batch.filter(id => !ids.includes(id));
+  await saveBatch();
+  renderBatch(); renderTodayStats();
 }
 
 /* ════════════════════════════ asset screen ═══════════════════════════ */
@@ -1890,7 +2114,10 @@ async function renderData(){
   <div class="card">
     ${session
       ? `<div class="statnow"><b>${esc(session.name)}</b><span class="assetno">${esc(session.role)}</span></div>
-         <p class="was" style="margin:0 0 12px">Unlocked in this tab. Closing the tab locks it again.</p>
+         <p class="was" style="margin:0 0 12px">${session.canEdit
+           ? 'Full access: status, editing, adding assets, photos and workbook imports.'
+           : 'Status updates, batch scanning and issue reports. Records cannot be edited with this key.'}
+           Unlocked in this tab; closing the tab locks it again.</p>
          <button class="btn btn-danger" onclick="lockNow()">Lock — back to view only</button>`
       : `<div class="viewnote">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="1.6"/><path d="M8 11V7.5a4 4 0 018 0V11"/></svg>
@@ -2007,12 +2234,13 @@ function net(){
   p.className = 'pill ' + (on ? 'on' : 'off');
   p.innerHTML = '<i class="dot"></i> ' + (on ? 'Online' : 'Offline — saved on device');
 }
-function render(){ net(); paintLock(); renderTodayStats(); renderRecent(); paintQueue(); }
+function render(){ net(); paintLock(); renderTodayStats(); renderRecent(); renderBatch(); paintQueue(); }
 
 $('#scanGo').onclick = () => doScan($('#scanInput').value);
 $('#scanInput').addEventListener('keydown', e => { if(e.key === 'Enter'){ e.preventDefault(); doScan(e.target.value); } });
 $('#btnCam').onclick = startCam;
 $('#btnWedge').onclick = toggleWedge;
+$('#btnBatch').onclick = toggleBatch;
 $('#lockBtn').onclick = () => session ? openLockDown() : openUnlock();
 $('#fab').onclick = () => openAdd();
 $('#scrim').onclick = closeSheet;
