@@ -544,6 +544,10 @@ let REV = '0', recent = [], apiUrl = '', sheetId = '';
 /* Result of the last health check. When the back end is not ready, the app says so
    loudly rather than quietly serving the bundled snapshot as though it were live. */
 let HEALTH = null;
+/* Bumped whenever index.html needs a newer Code.gs than before. If the deployment
+   reports a lower number the app says so, instead of failing on the first write. */
+const NEEDS_BACKEND = 5;
+const backendStale = () => !!(HEALTH && HEALTH.version != null && HEALTH.version < NEEDS_BACKEND);
 let usingSnapshot = true;
 let route = 'scan', currentAsset = null, wedge = false, findLimit = 60;
 /* Where the asset screen was opened from, so "back" goes where you expect. Opening an
@@ -1144,11 +1148,19 @@ async function doUnlock(){
     if(!res.ok){ $('#uGo').textContent = 'Unlock'; $('#uGo').disabled = false;
       return err(res.error || 'That key was not accepted.'); }
     localStorage.setItem('oriel.name', name);
-    // Deliberately not keeping `key`.
-    saveSession({ token: res.token, name, role: res.role,
-                  canEdit: !!res.canEdit, canStatus: !!res.canStatus, at: Date.now() });
+    /* Prefer the session token: the key is then never stored, and the token expires and
+       can be revoked. But if the deployment is older than this page it returns no token,
+       and storing neither leaves the session with no credential at all — every write
+       afterwards fails with "that key was not accepted" even though the unlock looked
+       fine. So fall back to holding the key, and say the deployment is behind. */
+    saveSession(res.token
+      ? { token: res.token, name, role: res.role,
+          canEdit: !!res.canEdit, canStatus: !!res.canStatus, at: Date.now() }
+      : { key, name, role: res.role, legacy: true,
+          canEdit: !!res.canEdit, canStatus: !!res.canStatus, at: Date.now() });
     closeSheet(); buzz();
     toast(res.canEdit ? 'Unlocked · Clinical Engineering' : 'Unlocked · move team, status updates only');
+    if(!res.token) console.warn('Apps Script returned no session token — the deployment is older than this page.');
     drain();
     render();                       // batch panel, header chip and stats all change with the role
     if(route === 'asset' && currentAsset) renderAsset(currentAsset);
@@ -2171,7 +2183,15 @@ async function stageImport(file){
 
     const res = await api.post({ action:'import', key: cred(), by: session.name,
                                  gz, filename: file.name, dryRun: true });
-    if(!res.ok) throw new Error(res.error || 'The sheet refused the import.');
+    if(!res.ok){
+      if(res.code === 'BAD_KEY'){
+        throw new Error(backendStale() || (session && session.legacy)
+          ? 'The Apps Script deployment is older than this page, so it does not recognise the ' +
+            'session. Publish a new version of Code.gs (Deploy > Manage deployments > edit > New version).'
+          : 'Your session has ended. Lock and unlock again, then retry the import.');
+      }
+      throw new Error(res.error || 'The sheet refused the import.');
+    }
     showImportPreview(res);
   }catch(e){
     st('<div class="err">' + esc(e.message || 'Could not read that file.') + '</div>');
@@ -2254,6 +2274,13 @@ async function renderData(){
 
   const bad = HEALTH && HEALTH.ok === false;
   $('#s-data').innerHTML = `
+  ${backendStale() || (session && session.legacy) ? `<div class="err">
+    <b>The Apps Script deployment is out of date.</b><br>
+    This page expects version ${NEEDS_BACKEND}; the deployment reports
+    ${HEALTH && HEALTH.version != null ? HEALTH.version : 'an older one'}.
+    Paste the latest <code class="k">Code.gs</code>, then
+    Deploy &rsaquo; Manage deployments &rsaquo; edit &rsaquo; <b>New version</b>.
+    Imports and photo uploads will be refused until you do.</div>` : ''}
   ${usingSnapshot && connected ? `<div class="banner" style="background:#F6DCDD;color:var(--stop-d)">
     <span><b>You are looking at the bundled snapshot, not your Google Sheet.</b>
     Nothing you change here has reached the Sheet.</span>
